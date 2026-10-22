@@ -1,0 +1,4 @@
+accession,dataset_title,use,url
+GSE175526,Single cell RNA-seq of bladder tissue,Development and same-study held-out test,https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE175526
+GSE310557,Multi-omics analysis identifies a microbiota-bile acid-TLR signaling axis driving bladder injury in interstitial cystitis,External validation,https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE310557
+E-GEAD-1192,Single-cell RNA sequencing reveals cellular dynamics in Hunner-type interstitial cystitis,External validation,https://ddbj.nig.ac.jp/public/ddbj_database/gea/experiment/E-GEAD-1000/E-GEAD-1192/
