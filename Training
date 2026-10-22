@@ -1,0 +1,767 @@
+"""IC three-model analysis with separate training and held-out evaluation.
+
+python train.py / python evaluate.py / python ic_pipeline.py all
+Settings are in config.json. Sparse matrices support reading and filtering; model fitting uses dense arrays with explicit zeros.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import gc
+import gzip
+import hashlib
+import importlib.metadata
+import io
+import json
+import logging
+import os
+from pathlib import Path
+import pickle
+import sys
+import time
+import warnings
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+from scipy import sparse
+from scipy.io import mmread
+from scipy.stats import mannwhitneyu, spearmanr
+from sklearn.base import clone
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (accuracy_score, average_precision_score,
+    confusion_matrix, f1_score, matthews_corrcoef, precision_score,
+    recall_score, roc_auc_score)
+from sklearn.model_selection import StratifiedKFold
+from sklearn.utils.class_weight import compute_class_weight
+from statsmodels.stats.multitest import multipletests
+import lightgbm as lgb
+import xgboost as xgb
+
+BASE_DIR = Path(__file__).resolve().parent
+LOG = logging.getLogger("IC")
+PACKAGES = ["numpy", "pandas", "scipy", "scikit-learn", "xgboost",
+            "lightgbm", "shap", "statsmodels", "openpyxl", "matplotlib"]
+MYELOID_MARKERS = ["LST1", "TYROBP", "FCER1G", "AIF1", "CTSS", "SAT1",
+    "FCN1", "LYZ", "CSTA", "MNDA", "S100A8", "S100A9", "LILRB1"]
+
+
+def write_json(path, obj):
+    Path(path).write_text(json.dumps(obj, ensure_ascii=False, indent=2,
+        default=lambda v: v.item() if isinstance(v, np.generic) else str(v)), encoding="utf-8")
+
+
+def versions():
+    out = {"python": sys.version, "platform": sys.platform}
+    for name in PACKAGES:
+        try:
+            out[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            out[name] = None
+    return out
+
+
+def hash_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def setup_log(path):
+    LOG.setLevel(logging.INFO)
+    for handler in list(LOG.handlers):
+        handler.close()
+        LOG.removeHandler(handler)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    for handler in [logging.StreamHandler(sys.stdout),
+                    logging.FileHandler(path, encoding="utf-8")]:
+        handler.setFormatter(fmt)
+        LOG.addHandler(handler)
+    logging.captureWarnings(True)
+    warning_log = logging.getLogger("py.warnings")
+    warning_log.handlers = LOG.handlers[:]
+    warning_log.setLevel(logging.WARNING)
+    warning_log.propagate = False
+    warnings.simplefilter("default")  # Keep convergence and version warnings visible.
+
+
+def save_table(df, stem, excel=True):
+    stem = Path(stem)
+    df.to_csv(stem.with_suffix(".csv"), index=False, encoding="utf-8-sig")
+    if excel:
+        try:
+            df.to_excel(stem.with_suffix(".xlsx"), index=False)
+        except ImportError:
+            LOG.warning("openpyxl is unavailable; complete CSV saved: %s", stem)
+
+
+@dataclass
+class Counts:
+    """Raw gene-by-cell counts; the cell table retains sample and barcode identifiers."""
+    X: sparse.csr_matrix
+    genes: np.ndarray
+    cells: pd.DataFrame
+
+    def subset(self, rows=None, cols=None):
+        rows = np.arange(self.X.shape[0]) if rows is None else rows
+        cols = np.arange(self.X.shape[1]) if cols is None else cols
+        return Counts(self.X[rows][:, cols].tocsr(), self.genes[rows],
+                      self.cells.iloc[np.arange(len(self.cells))[cols]].reset_index(drop=True))
+
+
+class DataSource:
+    """Read ZIP archives or directories directly; support both .tsv and .tsv.gz files."""
+    def __init__(self, path):
+        self.path = Path(path)
+        if not self.path.exists():
+            raise FileNotFoundError(f"Data not found: {self.path}; update data_root in config.json")
+        self.z = zipfile.ZipFile(self.path) if self.path.is_file() else None
+        self.inventory = []
+
+    def close(self):
+        if self.z:
+            self.z.close()
+
+    def find(self, sample, stem):
+        names = {stem, stem + ".gz"}
+        if self.z:
+            hits = [e for e in self.z.infolist() if not e.is_dir()
+                    and Path(e.filename).name in names
+                    and Path(e.filename).parent.name == sample]
+        else:
+            hits = [p for p in self.path.rglob("*") if p.is_file()
+                    and p.name in names and p.parent.name == sample]
+        if len(hits) != 1:
+            raise ValueError(f"Expected one {sample}/{stem}; found {len(hits)}. Check for duplicate compressed or uncompressed files.")
+        entry = hits[0]
+        self.inventory.append({"sample": sample, "file": entry.filename if self.z else str(entry),
+            "bytes": entry.file_size if self.z else entry.stat().st_size,
+            "crc32": entry.CRC if self.z else None,
+            "sha256": None if self.z else hash_file(entry)})
+        return entry
+
+    @contextlib.contextmanager
+    def opened(self, entry, text=False):
+        name = entry.filename if self.z else str(entry)
+        with contextlib.ExitStack() as stack:
+            f = stack.enter_context(self.z.open(entry) if self.z else open(entry, "rb"))
+            if name.endswith(".gz"):
+                f = stack.enter_context(gzip.GzipFile(fileobj=f))
+            if text:
+                f = stack.enter_context(io.TextIOWrapper(f, encoding="utf-8-sig"))
+            yield f
+
+
+# 0. Read 10X counts, sum duplicate symbols and merge samples using the original gene ordering.
+def read_10x_mtx(source, sample, label, donor_id):
+    with source.opened(source.find(sample, "features.tsv"), text=True) as f:
+        features = pd.read_csv(f, sep="\t", header=None)
+    if features.shape[1] < 2:
+        raise ValueError(f"{sample}: features must contain gene_id and gene_symbol columns")
+    genes = features[1].fillna(features[0]).astype(str).to_numpy()
+    with source.opened(source.find(sample, "barcodes.tsv"), text=True) as f:
+        barcodes = pd.read_csv(f, sep="\t", header=None)[0].astype(str).to_numpy()
+    with source.opened(source.find(sample, "matrix.mtx")) as f:
+        X = mmread(f).tocsr().astype(np.float32)
+    X.sum_duplicates()
+    X.eliminate_zeros()
+    if X.shape != (len(genes), len(barcodes)):
+        raise ValueError(f"{sample}: matrix shape {X.shape} differs from feature or barcode dimensions")
+    if not np.isfinite(X.data).all() or np.any(X.data < 0):
+        raise ValueError(f"{sample}: negative or nonfinite values found; raw nonnegative counts are required")
+    if len(set(barcodes)) != len(barcodes):
+        raise ValueError(f"{sample}: duplicate barcodes within the sample; check the input")
+    duplicate_count = len(genes) - len(set(genes))
+    if duplicate_count:
+        # Sparse row aggregation reproduces the sorted DataFrame.groupby(level=0).sum() operation.
+        unique = np.array(sorted(set(genes)))
+        lookup = {g: i for i, g in enumerate(unique)}
+        A = sparse.csr_matrix((np.ones(len(genes), np.float32),
+            ([lookup[g] for g in genes], np.arange(len(genes)))), shape=(len(unique), len(genes)))
+        X = (A @ X).tocsr()
+        X.eliminate_zeros()
+        genes = unique
+    cells = pd.DataFrame({"cell_id": [f"{sample}_{b}" for b in barcodes],
+        "sample": sample, "donor_id": donor_id, "barcode": barcodes,
+        "matrix_column": np.arange(len(barcodes)), "label": label})
+    LOG.info("Read %s: %s; duplicate-symbol rows merged=%d", sample, X.shape, duplicate_count)
+    return Counts(X, genes, cells)
+
+
+def align_genes(data, genes):
+    lookup = {g: i for i, g in enumerate(data.genes)}
+    pairs = [(i, lookup[g]) for i, g in enumerate(genes) if g in lookup]
+    A = sparse.csr_matrix((np.ones(len(pairs), np.float32),
+        ([p[0] for p in pairs], [p[1] for p in pairs])), shape=(len(genes), len(data.genes)))
+    return Counts((A @ data.X).tocsr(), np.array(genes), data.cells.copy())
+
+
+def merge_samples(source, samples, label, cfg):
+    data = [read_10x_mtx(source, s, label, cfg["donor_ids"][s]) for s in samples]
+    genes = pd.Index(data[0].genes)
+    for d in data[1:]:
+        genes = genes.intersection(pd.Index(d.genes), sort=False)
+    if not len(genes):
+        raise ValueError("No genes are shared across samples")
+    aligned = [align_genes(d, genes) for d in data]
+    return Counts(sparse.hstack([d.X for d in aligned], format="csr"), genes.to_numpy(),
+                  pd.concat([d.cells for d in aligned], ignore_index=True))
+
+
+def common_pair(pos, neg):
+    genes = pd.Index(pos.genes).intersection(pd.Index(neg.genes), sort=False).to_numpy()
+    return align_genes(pos, genes), align_genes(neg, genes)
+
+
+# 1. Apply the original QC thresholds to sparse counts. The UMI ceiling is not a dedicated doublet detector.
+def cell_qc(data, cfg, out, tag):
+    q = cfg["qc"]
+    X, genes = data.X, data.genes
+    total = np.asarray(X.sum(axis=0)).ravel()
+    detected = np.asarray((X > 0).sum(axis=0)).ravel()
+    mt = np.array([g.lower().startswith("mt-") for g in genes])
+    hb = np.isin(genes, ["HBA1", "HBA2", "HBB", "HBD", "HBG1", "HBG2", "HBE1", "HBM"])
+    mito = np.divide(np.asarray(X[mt].sum(axis=0)).ravel(), total,
+                     out=np.full(total.shape, np.nan, dtype=np.float32), where=total > 0)
+    hemo = np.divide(np.asarray(X[hb].sum(axis=0)).ravel(), total,
+                     out=np.full(total.shape, np.nan, dtype=np.float32), where=total > 0)
+    keep = ((total >= q["min_umi"]) & (total <= q["max_umi"])
+        & (detected >= q["min_genes"]) & (detected <= q["max_genes"])
+        & (mito >= q["min_mito"]) & (mito <= q["max_mito"]) & (hemo <= q["max_hemo"]))
+    details = data.cells.assign(total_umi=total, detected_genes=detected,
+                              mito_ratio=mito, hemo_ratio=hemo, qc_pass=keep)
+    details.to_csv(out / f"{tag}_cell_qc.csv.gz", index=False, compression="gzip")
+    summary = details.groupby(["sample", "donor_id", "label"], sort=False).agg(
+        initial_barcodes=("cell_id", "size"), qc_pass=("qc_pass", "sum"))
+    summary.to_csv(out / f"{tag}_qc_summary.csv", encoding="utf-8-sig")
+    LOG.info("%s QC: %d → %d", tag, X.shape[1], keep.sum())
+    if not keep.any():
+        raise ValueError(f"{tag}: no cells remain after QC; thresholds are not relaxed automatically")
+    return data.subset(rows=~mt, cols=keep)
+
+
+def gene_filter(pos, neg, cfg):
+    C = sparse.hstack([pos.X, neg.X], format="csr")
+    counts = np.asarray((C > 0).sum(axis=1)).ravel()
+    means = np.asarray(C.sum(axis=1)).ravel() / np.float32(C.shape[1])
+    keep = (counts >= cfg["qc"]["min_cells_per_gene"]) & (means >= cfg["qc"]["min_gene_mean"])
+    if not keep.any():
+        raise ValueError("No genes remain after filtering")
+    LOG.info("Gene filtering: %d -> %d", len(pos.genes), keep.sum())
+    return pos.subset(rows=keep), neg.subset(rows=keep)
+
+
+def load_and_qc(pos, neg, cfg, out, prefix, filter_genes=True):
+    pos, neg = common_pair(pos, neg)
+    pos = cell_qc(pos, cfg, out, prefix + "_positive")
+    neg = cell_qc(neg, cfg, out, prefix + "_negative")
+    if filter_genes:
+        pos, neg = gene_filter(pos, neg, cfg)
+    return pos, neg
+
+
+# 2. Retain the original requirement of at least two detected genes in the 13-marker panel.
+def filter_myeloid_cells(pos, neg, cfg):
+    markers = [g for g in cfg["myeloid_markers"] if g in set(pos.genes) and g in set(neg.genes)]
+    if len(markers) < cfg["min_myeloid_hits"]:
+        raise ValueError("Too few shared myeloid markers")
+    out = []
+    for data in [pos, neg]:
+        ix = np.flatnonzero(np.isin(data.genes, markers))
+        hits = np.asarray((data.X[ix] > 0).sum(axis=0)).ravel()
+        selected = data.subset(cols=hits >= cfg["min_myeloid_hits"])
+        selected.cells["myeloid_marker_hits"] = hits[hits >= cfg["min_myeloid_hits"]]
+        if not len(selected.cells):
+            raise ValueError("A group contains no cells after myeloid marker filtering")
+        LOG.info("%s myeloid-marker-selected cells: %d / %d", data.cells['sample'].unique().tolist(),
+                 len(selected.cells), len(data.cells))
+        out.append(selected)
+    return out
+
+
+# 3. Apply the original log1p transform without additional normalization, scaling, HVG selection, batch integration or ternarization.
+def compute_expression_features(pos, neg, out):
+    raw = sparse.vstack([pos.X.T, neg.X.T], format="csr")
+    raw.eliminate_zeros()
+    sparse.save_npz(out / "raw_myeloid_counts.npz", raw)
+    # Densify after filtering and retain explicit zeros; implicit sparse zeros change XGBoost input semantics.
+    X = np.lib.format.open_memmap(out / "X_features.npy", mode="w+", dtype=np.float32, shape=raw.shape)
+    for start in range(0, raw.shape[0], 256):
+        X[start:start+256] = np.log1p(raw[start:start+256].toarray())
+    X.flush()
+    cells = pd.concat([pos.cells, neg.cells], ignore_index=True)
+    cells.to_csv(out / "cell_manifest.csv", index=False, encoding="utf-8-sig")
+    return X, cells["label"].to_numpy(dtype=int), raw, cells
+
+
+def make_models(cfg):
+    return {
+        "LogisticRegression": LogisticRegression(max_iter=1000, random_state=42),
+        "XGBoost": xgb.XGBClassifier(eval_metric="logloss", random_state=42, n_jobs=cfg["n_jobs"]),
+        "LightGBM": lgb.LGBMClassifier(random_state=42, n_jobs=cfg["n_jobs"], verbosity=-1),
+    }
+
+
+def balanced_weights(y):
+    classes = np.unique(y)
+    weights = compute_class_weight("balanced", classes=classes, y=y)
+    return np.array([dict(zip(classes, weights))[v] for v in y])
+
+
+def calculate_metrics(y, pred, prob):
+    tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+    return {"Accuracy": float(accuracy_score(y, pred)),
+        "AUC": float(roc_auc_score(y, prob)) if len(np.unique(y)) == 2 else None,
+        "F1": float(f1_score(y, pred, zero_division=0)),
+        "Precision": float(precision_score(y, pred, zero_division=0)),
+        "Sensitivity": float(recall_score(y, pred, zero_division=0)),
+        "Specificity": float(tn / (tn + fp)) if tn + fp else None,
+        "MCC": float(matthews_corrcoef(y, pred)),
+        "AP": float(average_precision_score(y, prob)),
+        "TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp)}
+
+
+# 5. Cell-level five-fold CV describes discrimination within the development donors; it is not donor-held-out validation.
+def cross_validate_models(X, y, cells, models, cfg, out):
+    if min(np.bincount(y, minlength=2)) < cfg["cv_folds"]:
+        raise ValueError("Each class must contain at least as many cells as CV folds")
+    LOG.warning("Internal five-fold CV uses cell-stratified splits after QC and gene filtering of all training donors. "
+                "Cells from a donor occur in multiple folds; these descriptive metrics do not estimate generalization to independent donors.")
+    folds = StratifiedKFold(n_splits=cfg["cv_folds"], shuffle=True, random_state=42)
+    rows, prediction_parts = [], []
+    split_manifest = []
+    for fold, (tr0, te0) in enumerate(folds.split(X, y), 1):
+        # Retain positive-then-negative cell order within each partition.
+        tr = np.r_[tr0[y[tr0] == 1], tr0[y[tr0] == 0]]
+        te = np.r_[te0[y[te0] == 1], te0[y[te0] == 0]]
+        split_manifest.append(cells.iloc[te].assign(cv_fold=fold))
+        for name, template in models.items():
+            t = time.time()
+            model = clone(template)
+            model.fit(X[tr], y[tr], sample_weight=balanced_weights(y[tr]))
+            prob, pred = model.predict_proba(X[te])[:, 1], model.predict(X[te])
+            row = {"Model": name, "Fold": fold, "seconds": time.time()-t,
+                   **calculate_metrics(y[te], pred, prob)}
+            rows.append(row)
+            prediction_parts.append(cells.iloc[te].assign(Model=name, Fold=fold,
+                                       prediction=pred, probability=prob))
+            LOG.info("Internal CV %s fold%d AUC=%.6f", name, fold, row["AUC"])
+            pd.DataFrame(rows).to_csv(out / "internal_cv_folds.csv", index=False)
+            del model
+            gc.collect()
+    metrics = pd.DataFrame(rows)
+    save_table(metrics, out / "internal_cv_folds")
+    save_table(metrics.groupby("Model", sort=False)[["Accuracy", "AUC", "F1"]].agg(["mean", "std"])
+               .reset_index().set_axis(["Model", "Accuracy_mean", "Accuracy_std", "AUC_mean", "AUC_std", "F1_mean", "F1_std"], axis=1),
+               out / "internal_cv_summary")
+    pd.concat(prediction_parts).to_csv(out / "internal_cv_predictions.csv.gz", index=False, compression="gzip")
+    pd.concat(split_manifest).to_csv(out / "internal_cv_cell_folds.csv", index=False)
+    return metrics
+
+
+def dump_pickle(obj, path):
+    # Protocol 5 reduces intermediate copies of large arrays; retain downstream filenames.
+    with open(path, "wb") as f:
+        pickle.dump(obj, f, protocol=5)
+
+
+# 6. Fit the original three models with balanced sample weights and retain the predefined interpretation model.
+def train_final_models(X, y, genes, models, out):
+    dump_pickle(list(genes), out / "feature_genes.pkl")
+    pd.DataFrame({"gene": genes}).to_csv(out / "feature_genes.csv", index=False)
+    for name, model in models.items():
+        LOG.info("Final fit: %s", name)
+        model.fit(X, y, sample_weight=balanced_weights(y))
+        dump_pickle(model, out / f"{name}.pkl")
+        if name == "LightGBM":
+            model.booster_.save_model(str(out / "LightGBM_native.txt"))
+        if name == "XGBoost":
+            model.save_model(str(out / "XGBoost_native.ubj"))
+    return models
+
+
+# 4. Retain exploratory cell-level Mann-Whitney U, log2FC and BH calculations; these are not donor-level inference.
+def differential_expression(raw, y, genes):
+    LOG.warning("Retain exploratory cell-level Mann-Whitney U for comparison with the original analysis. "
+                "Cells are not independent biological donors; FDR adjustment does not remove within-donor dependence.")
+    raw = raw.tocsc()
+    values = []
+    for j in range(raw.shape[1]):
+        a = raw[y == 1, j].toarray().ravel()
+        b = raw[y == 0, j].toarray().ravel()
+        # Use raw counts directly to avoid round-trip floating-point error from expm1(log1p(x)).
+        fc = np.log2((a.mean() + 1) / (b.mean() + 1))
+        p = mannwhitneyu(a, b, alternative="two-sided").pvalue
+        values.append((float(fc), float(p)))
+    values = np.asarray(values)
+    return pd.DataFrame({"gene": genes, "log2FC": values[:, 0], "p_value": values[:, 1],
+                         "adj_p": multipletests(values[:, 1], method="fdr_bh")[1]})
+
+
+# 7. Use the same model and full training-cell background; calculate SHAP in batches to limit peak memory.
+def shap_analysis_and_export(model, X, y, genes, de_res, cfg, out):
+    import shap
+    explainer = shap.TreeExplainer(model)
+    values = np.lib.format.open_memmap(out / "shap_values.npy", mode="w+", dtype=np.float64, shape=X.shape)
+    abs_sum, signed_sum = np.zeros(X.shape[1]), np.zeros(X.shape[1])
+    batch_size = cfg["shap_batch_size"]
+    for start in range(0, len(y), batch_size):
+        v = explainer.shap_values(X[start:start+batch_size])
+        if isinstance(v, list):
+            v = v[1]
+        v = np.asarray(v)
+        if v.ndim == 3 and v.shape[-1] == 2:
+            v = v[:, :, 1]
+        if v.shape != X[start:start+batch_size].shape:
+            raise ValueError(f"Unsupported SHAP dimensions: {v.shape}")
+        if not np.isfinite(v).all():
+            raise ValueError("Nonfinite SHAP values detected")
+        values[start:start+len(v)] = v
+        abs_sum += np.abs(v).sum(axis=0)
+        signed_sum += v.sum(axis=0)
+    values.flush()
+    result = pd.DataFrame({"gene": genes, "shap_abs_mean": abs_sum/len(y),
+                           "shap_mean": signed_sum/len(y)})
+    result = result.merge(de_res, on="gene", how="inner").sort_values("shap_abs_mean", ascending=False)
+    save_table(result, out / "shap_de_results")
+    if cfg["save_legacy_pickles"]:
+        dump_pickle(np.asarray(values), out / "shap_values.pkl")
+        cell_ids = pd.read_csv(out / "cell_manifest.csv")["cell_id"].to_numpy()
+        dump_pickle(pd.DataFrame(np.asarray(X), index=cell_ids, columns=genes), out / "X_features.pkl")
+        dump_pickle(y, out / "y_labels.pkl")
+    write_json(out / "interpretation_metadata.json", {"model": cfg["shap_model"],
+        "cells": "training_only", "SHAP": "TreeExplainer, all training cells, batched",
+        "gene_ranking": "mean absolute SHAP; no key-gene list is forced",
+        "DE": "cell-level Mann-Whitney U; exploratory, not donor-level inference",
+        "historical_preregistration": False,
+        "note": "Interpretation uses the original LightGBM model. The fixed configuration is not a claim of historical preregistration."})
+    return result
+
+
+def select_core_genes(df, top_n=200):
+    """Retain the original candidate-selection rule, which did not apply an ALPHA filter at this step."""
+    df = df.copy()
+    for column in ["adj_p", "log2FC", "shap_mean", "shap_abs_mean"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df = df.dropna(subset=["gene", "adj_p", "log2FC", "shap_mean", "shap_abs_mean"])
+    df["direction_consistency"] = (df["shap_mean"] * df["log2FC"]) > 0
+    consistent = df[df["direction_consistency"]].copy()
+    down = consistent[consistent["log2FC"] < 0].sort_values("shap_abs_mean", ascending=False).head(top_n)
+    up = consistent[consistent["log2FC"] > 0].sort_values("shap_abs_mean", ascending=False).head(top_n)
+    return {"up": up, "down": down}
+
+
+def export_core_genes(result, out):
+    core = select_core_genes(result)
+    for direction, df in core.items():
+        df.to_csv(out / f"core_genes_{direction}.csv", index=False, encoding="utf-8-sig")
+    try:
+        with pd.ExcelWriter(out / "core_genes.xlsx") as writer:
+            for direction, df in core.items():
+                # Retain both *_top200 and up/down sheet names for downstream compatibility.
+                df.to_excel(writer, sheet_name=direction, index=False)
+                df.to_excel(writer, sheet_name=direction+"_top200", index=False)
+    except ImportError:
+        LOG.warning("openpyxl is unavailable; complete candidate lists saved as CSV")
+    write_json(out / "core_selection_rule.json", {
+        "source": "Original direction-consistent candidate-selection procedure",
+        "rule": "shap_mean * log2FC > 0; split by log2FC sign; sort shap_abs_mean desc; head(200)",
+        "additional_adj_p_filter": False,
+        "note": "The original ALPHA=0.05 defined plot reference lines, not an additional candidate-selection filter. "
+                "Direction-consistent SHAP is a selection criterion, not a causal effect.",
+        "counts": {k: len(v) for k, v in core.items()}})
+    return core
+
+
+def compare_reference(result, cfg, out):
+    path = Path(cfg.get("reference_shap_table", ""))
+    if not path.is_file():
+        LOG.info("Reference SHAP table not found; skip historical ranking comparison: %s", path)
+        write_json(out / "gene_stability.json", {"status": "reference_not_found",
+            "reference_file": str(path), "verified_same_genes": False})
+        return
+    old = pd.read_excel(path) if path.suffix.lower() == ".xlsx" else pd.read_csv(path)
+    if "gene" not in old or "shap_abs_mean" not in old:
+        raise ValueError("Reference table must contain gene and shap_abs_mean columns")
+    old = old.sort_values("shap_abs_mean", ascending=False).drop_duplicates("gene").reset_index(drop=True)
+    old["old_rank"] = np.arange(1, len(old)+1)
+    new = result.reset_index(drop=True).copy()
+    new["new_rank"] = np.arange(1, len(new)+1)
+    joined = old[["gene", "old_rank", "shap_abs_mean"]].rename(columns={"shap_abs_mean": "old_abs_SHAP"}).merge(
+        new[["gene", "new_rank", "shap_abs_mean"]].rename(columns={"shap_abs_mean": "new_abs_SHAP"}), on="gene", how="outer")
+    joined["rank_change"] = joined["new_rank"] - joined["old_rank"]
+    save_table(joined, out / "gene_rank_comparison")
+    report = {}
+    for k in [10, 20, 100, 200]:
+        a, b = set(old.gene.head(k)), set(new.gene.head(k))
+        report[f"Top{k}"] = {"overlap": len(a & b), "Jaccard": len(a & b)/len(a | b),
+            "same_order": old.gene.head(k).tolist() == new.gene.head(k).tolist()}
+    both = joined.dropna()
+    report["rank_spearman_all_common_genes"] = float(spearmanr(both.old_rank, both.new_rank).statistic)
+    report["reference_file"] = str(path)
+    report["reference_sha256"] = hash_file(path)
+    report["key_genes_for_audit_only"] = joined[joined.gene.isin(["SRGN", "PCSK1", "A2M"])].to_dict("records")
+    if all(c in old for c in ["shap_mean", "log2FC", "adj_p"]):
+        old_core, new_core = select_core_genes(old), select_core_genes(result)
+        report["original_direction_consistent_core_rule"] = {}
+        for direction in ["up", "down"]:
+            a, b = old_core[direction].gene.tolist(), new_core[direction].gene.tolist()
+            sa, sb = set(a), set(b)
+            report["original_direction_consistent_core_rule"][direction] = {
+                "old_count": len(a), "new_count": len(b), "overlap": len(sa & sb),
+                "Jaccard": len(sa & sb)/len(sa | sb) if sa | sb else 1.0,
+                "same_order": a == b, "added": sorted(sb-sa), "removed": sorted(sa-sb)}
+    write_json(out / "gene_stability.json", report)
+    LOG.info("Gene-ranking comparison: %s", report)
+
+
+def validate_config(cfg):
+    train = cfg["train_positive"] + cfg["train_negative"]
+    test = cfg["test_positive"] + cfg["test_negative"]
+    if not all([cfg[k] for k in ["train_positive", "train_negative", "test_positive", "test_negative"]]):
+        raise ValueError("Both positive and negative groups are required for training and testing")
+    if len(train + test) != len(set(train + test)):
+        raise ValueError("Duplicate sample directories or overlap between training and test samples")
+    donor = cfg["donor_ids"]
+    if any(s not in donor or not str(donor[s]).strip() for s in train + test):
+        raise ValueError("Assign a biological donor_id to every sample; barcodes alone do not establish donor independence")
+    if {donor[s] for s in train} & {donor[s] for s in test}:
+        raise ValueError("Training and test donors overlap")
+    if cfg["shap_model"] != "LightGBM":
+        raise ValueError("This analysis retains LightGBM for interpretation; changing the model changes the analysis protocol")
+    if cfg["cv_folds"] < 2 or cfg["shap_batch_size"] < 1 or cfg["prediction_batch_size"] < 1:
+        raise ValueError("Invalid fold count or batch size")
+
+
+def train(cfg, run_dir=None):
+    out = run_dir or Path(cfg["output_root"]) / datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
+    out.mkdir(parents=True, exist_ok=False)
+    setup_log(out / "train.log")
+    write_json(out / "config_snapshot.json", cfg)
+    write_json(out / "environment.json", versions())
+    source = DataSource(cfg["data_root"])
+    try:
+        # Pipeline: read counts, QC, myeloid filtering, internal CV, final fit, exploratory DE and SHAP.
+        LOG.info("Step 0: read training samples only; held-out samples are not read at this stage.")
+        pos = merge_samples(source, cfg["train_positive"], 1, cfg)
+        neg = merge_samples(source, cfg["train_negative"], 0, cfg)
+        LOG.info("Step 1: apply QC thresholds and gene filtering")
+        pos, neg = load_and_qc(pos, neg, cfg, out, "train")
+        LOG.info("Step 2: apply the myeloid marker selection rule")
+        pos, neg = filter_myeloid_cells(pos, neg, cfg)
+        genes = pos.genes.tolist()
+        X, y, raw, cells = compute_expression_features(pos, neg, out)
+        del pos, neg
+        gc.collect()
+        models = make_models(cfg)
+        write_json(out / "model_parameters.json", {k: m.get_params() for k, m in models.items()})
+        LOG.info("Step 3: descriptive cell-level five-fold CV within training data")
+        cross_validate_models(X, y, cells, models, cfg, out)
+        LOG.info("Step 4: final fitting of the three models")
+        models = train_final_models(X, y, genes, models, out)
+        LOG.info("Step 5: exploratory differential expression using the original rule")
+        de = differential_expression(raw, y, genes)
+        save_table(de, out / "differential_expression")
+        LOG.info("Step 6: batched LightGBM SHAP across all training cells")
+        result = shap_analysis_and_export(models[cfg["shap_model"]], X, y, genes, de, cfg, out)
+        export_core_genes(result, out)
+        compare_reference(result, cfg, out)
+        write_json(out / "input_inventory_train.json", {"root": str(source.path),
+            "zip_sha256": hash_file(source.path) if source.z else None,
+            "files": source.inventory})
+        write_json(out / "train_complete.json", {"cells": len(y), "genes": len(genes),
+            "positive": int((y == 1).sum()), "negative": int((y == 0).sum()),
+            "implementation_sha256": hash_file(Path(__file__)),
+            "SHAP_model": cfg["shap_model"], "training_samples": cfg["train_positive"]+cfg["train_negative"]})
+        latest = Path(cfg["output_root"]) / "latest_run.txt"
+        latest.write_text(str(out.resolve()), encoding="utf-8")
+        LOG.info("Training completed: %s", out)
+    finally:
+        source.close()
+    return out
+
+
+def predict_batches(model, X, batch_size):
+    predictions, probs = [], []
+    for start in range(0, X.shape[0], batch_size):
+        batch = X[start:start+batch_size].toarray()
+        predictions.append(model.predict(batch))
+        probs.append(model.predict_proba(batch)[:, 1])
+    return np.concatenate(predictions), np.concatenate(probs)
+
+
+def plot_evaluation(y, predictions, probabilities, out, tag):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from sklearn.metrics import roc_curve, precision_recall_curve
+        from sklearn.calibration import calibration_curve
+    except ImportError:
+        LOG.warning("matplotlib is unavailable; metrics and predictions were saved without figures")
+        return
+    plt.rcParams.update({"font.family": "Arial", "font.size": 12,
+        "font.weight": "bold", "axes.labelweight": "bold", "axes.titleweight": "bold"})
+    for kind in ["ROC", "PR", "Calibration"]:
+        fig, ax = plt.subplots(figsize=(7, 6))
+        for name, prob in probabilities.items():
+            if kind == "ROC":
+                a, b, _ = roc_curve(y, prob)
+                label = f"{name} (AUC={roc_auc_score(y, prob):.3f})"
+            elif kind == "PR":
+                b, a, _ = precision_recall_curve(y, prob)
+                label = f"{name} (AP={average_precision_score(y, prob):.3f})"
+            else:
+                b, a = calibration_curve(y, prob, n_bins=min(5, max(2, len(y)//20)), strategy="quantile")
+                label = name
+            ax.plot(a, b, linewidth=2, label=label)
+        if kind in ["ROC", "Calibration"]:
+            ax.plot([0, 1], [0, 1], "--", color="gray")
+        if kind == "PR":
+            ax.axhline(y.mean(), linestyle="--", color="gray")
+        axis_names = {"ROC": ("False positive rate", "True positive rate"),
+            "PR": ("Recall", "Precision"),
+            "Calibration": ("Mean predicted probability", "Observed fraction of class 1")}
+        ax.set(xlabel=axis_names[kind][0], ylabel=axis_names[kind][1], title=f"Donor-held-out {kind}")
+        ax.legend(fontsize=10)
+        ax.grid(alpha=.2)
+        fig.tight_layout()
+        fig.savefig(out / f"{tag}_{kind}.png", dpi=240)
+        plt.close(fig)
+    fig, axes = plt.subplots(1, len(predictions), figsize=(13, 4))
+    for ax, (name, pred) in zip(np.atleast_1d(axes), predictions.items()):
+        cm = confusion_matrix(y, pred, labels=[0, 1])
+        ax.imshow(cm, cmap="Blues")
+        for (i, j), value in np.ndenumerate(cm):
+            ax.text(j, i, str(value), ha="center", va="center",
+                    color="white" if value > cm.max()/2 else "black", fontsize=13)
+        ax.set(title=name, xlabel="Predicted", ylabel="True", xticks=[0, 1], yticks=[0, 1])
+    fig.tight_layout()
+    fig.savefig(out / f"{tag}_confusion.png", dpi=240)
+    plt.close(fig)
+
+
+def evaluate(cfg, run_dir):
+    run_dir = Path(run_dir)
+    if not (run_dir / "train_complete.json").is_file():
+        raise ValueError("Training is incomplete; partial model outputs cannot be evaluated")
+    frozen = json.loads((run_dir / "config_snapshot.json").read_text(encoding="utf-8"))
+    # Evaluate with the saved biological configuration; do not change thresholds or donor assignments.
+    for key in ["qc", "myeloid_markers", "min_myeloid_hits", "train_positive", "train_negative",
+                "test_positive", "test_negative", "donor_ids"]:
+        if cfg[key] != frozen[key]:
+            raise ValueError(f"Current setting {key} differs from the training snapshot; use the matching configuration")
+    old_env, new_env = json.loads((run_dir / "environment.json").read_text()), versions()
+    mismatched = {k: [old_env[k], new_env[k]] for k in
+        ["numpy", "scipy", "scikit-learn", "xgboost", "lightgbm", "pandas"] if old_env[k] != new_env[k]}
+    if mismatched and not cfg["allow_version_mismatch"]:
+        raise ValueError(f"Training and evaluation environments differ: {mismatched}. Install the recorded requirements; override only for diagnostics.")
+    out = run_dir / ("test_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+    out.mkdir()
+    setup_log(out / "evaluation.log")
+    if mismatched:
+        LOG.warning("Version differences allowed for diagnostics only: %s", mismatched)
+    with open(run_dir / "feature_genes.pkl", "rb") as f:
+        genes = pickle.load(f)
+    models = {}
+    for name in ["LogisticRegression", "XGBoost", "LightGBM"]:
+        with open(run_dir / f"{name}.pkl", "rb") as f:
+            models[name] = pickle.load(f)
+    source = DataSource(cfg["data_root"])
+    try:
+        pos = merge_samples(source, cfg["test_positive"], 1, cfg)
+        neg = merge_samples(source, cfg["test_negative"], 0, cfg)
+        # Align shared genes, apply cell QC and exclude mitochondrial genes; evaluate legacy filtering and fixed training features separately.
+        pos, neg = load_and_qc(pos, neg, cfg, out, "test", filter_genes=False)
+        rows, prediction_parts = [], []
+        for mode in ["legacy_test_filter", "fixed_training_features"]:
+            if mode == "legacy_test_filter":
+                p, n = gene_filter(pos, neg, cfg)
+            else:
+                p, n = pos, neg
+            p, n = filter_myeloid_cells(p, n, cfg)
+            missing = [g for g in genes if g not in set(p.genes)]
+            pd.DataFrame({"missing_gene": missing}).to_csv(out / f"{mode}_missing_genes.csv", index=False)
+            p, n = align_genes(p, genes), align_genes(n, genes)
+            X = sparse.vstack([p.X.T, n.X.T], format="csr")
+            X.data = np.log1p(X.data)
+            cells = pd.concat([p.cells, n.cells], ignore_index=True)
+            y = cells.label.to_numpy(dtype=int)
+            all_pred, all_prob = {}, {}
+            for name, model in models.items():
+                pred, prob = predict_batches(model, X, cfg["prediction_batch_size"])
+                prob = np.clip(prob, 1e-6, 1-1e-6)  # Retain the original held-out evaluation convention.
+                row = {"Mode": mode, "Model": name, "cells": len(y), "missing_genes": len(missing),
+                       **calculate_metrics(y, pred, prob)}
+                rows.append(row)
+                prediction_parts.append(cells.assign(Mode=mode, Model=name, prediction=pred, probability=prob))
+                all_pred[name], all_prob[name] = pred, prob
+                LOG.info("%s %s AUC=%.6f", mode, name, row["AUC"])
+            cells.to_csv(out / f"{mode}_cell_manifest.csv", index=False)
+            if cfg["make_plots"]:
+                plot_evaluation(y, all_pred, all_prob, out, mode)
+            del X, p, n
+            gc.collect()
+        save_table(pd.DataFrame(rows), out / "independent_metrics")
+        predictions = pd.concat(prediction_parts, ignore_index=True)
+        predictions.to_csv(out / "independent_predictions.csv.gz", index=False, compression="gzip")
+        summary = predictions.groupby(["Mode", "Model", "sample", "donor_id", "label"], sort=False).agg(
+            cells=("cell_id", "size"), mean_probability=("probability", "mean"),
+            median_probability=("probability", "median"), positive_fraction=("prediction", "mean")).reset_index()
+        save_table(summary, out / "donor_descriptive_summary")
+        write_json(out / "evaluation_design.json", {"same_study_donor_held_out": True,
+            "exploratory": True, "model_fit_during_evaluation": False,
+            "automatic_model_selection": False, "training_run": str(run_dir.resolve()),
+            "training_samples": frozen["train_positive"]+frozen["train_negative"],
+            "test_samples": cfg["test_positive"]+cfg["test_negative"],
+            "input_inventory": source.inventory,
+            "model_SHA256": {name: hash_file(run_dir/f"{name}.pkl") for name in models},
+            "note": "Held-out donors from the same study; two-donor summaries are descriptive, not a robust patient-level AUC estimate. "
+                    "The fixed-feature comparison does not modify training or select the interpretation model."})
+        (run_dir / "latest_test.txt").write_text(str(out.resolve()), encoding="utf-8")
+        LOG.info("Held-out evaluation completed: %s", out)
+    finally:
+        source.close()
+    return out
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("stage", choices=["train", "test", "all", "full", "supplement", "collect", "pseudobulk", "robustness", "report"])
+    parser.add_argument("--config", default=str(BASE_DIR / "config.json"))
+    parser.add_argument("--run-dir", help="Completed training directory for held-out evaluation")
+    parser.add_argument("--supplement-config", default=str(BASE_DIR / "supplement_config.json"))
+    parser.add_argument("--supplement-dir", help="Existing supplement directory for cached DE, sensitivity analysis or reporting")
+    args = parser.parse_args(argv)
+    config_path = Path(args.config).resolve()
+    cfg = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    for key in ["data_root", "output_root", "reference_shap_table"]:
+        p = Path(cfg[key])
+        if not p.is_absolute():
+            cfg[key] = str((config_path.parent / p).resolve())
+    validate_config(cfg)
+    if args.stage in ["train", "all", "full"]:
+        run_dir = train(cfg)
+    else:
+        latest = Path(cfg["output_root"]) / "latest_run.txt"
+        if not args.run_dir and not latest.is_file():
+            raise FileNotFoundError("Run train.py first, or specify a completed training directory with --run-dir")
+        run_dir = Path(args.run_dir or latest.read_text(encoding="utf-8").strip())
+    if args.stage in ["test", "all", "full"]:
+        evaluate(cfg, run_dir)
+    if args.stage in ["full", "supplement", "collect", "pseudobulk", "robustness", "report"]:
+        if args.stage in ["pseudobulk", "robustness", "report"] and not args.supplement_dir:
+            parser.error("Standalone pseudobulk, robustness or report stages require --supplement-dir pointing to a completed collection")
+        # Avoid importing a second copy when this file is executed as __main__.
+        sys.modules.setdefault("ic_pipeline", sys.modules[__name__])
+        from ic_supplement import run
+        run(cfg, run_dir, args.supplement_config,
+            "supplement" if args.stage == "full" else args.stage, args.supplement_dir)
+
+
+if __name__ == "__main__":
+    main()
